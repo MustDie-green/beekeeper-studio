@@ -27,6 +27,27 @@
           <input type="checkbox" id="show-all-history-checkbox" v-model="showAllHistory"/>
           <label for="show-all-history-checkbox" class="show-all-history-text">Show all</label>
         </div>
+        <!-- Filter -->
+        <div class="fixed query-filter">
+          <div class="filter">
+            <div class="filter-wrap">
+              <input
+                class="filter-input"
+                type="text"
+                placeholder="Filter"
+                v-model="filterQuery"
+              >
+              <x-buttons class="filter-actions">
+                <x-button
+                  @click="clearFilter"
+                  v-if="filterQuery"
+                >
+                  <i class="clear material-icons">cancel</i>
+                </x-button>
+              </x-buttons>
+            </div>
+          </div>
+        </div>
         <error-alert
           v-if="error"
           :error="error"
@@ -88,7 +109,8 @@ import SidebarLoading from '@/components/common/SidebarLoading.vue'
         checkedHistoryQueries: [],
         timeAgo: new TimeAgo('en-US'),
         selected: null,
-        showAllHistory: false
+        showAllHistory: true,
+        filterQuery: ''
       }
     },
     computed: {
@@ -98,11 +120,15 @@ import SidebarLoading from '@/components/common/SidebarLoading.vue'
         return `Remove ${this.checkedHistoryQueries.length} saved history queries`;
       },
       currentHistory(){
-        if(this.showAllHistory){
-          return this.history;
-        } else {
-          return this.history.filter(item => item.connectionId === this.usedConfig?.id);
+        let result = this.history;
+        if(!this.showAllHistory){
+          result = result.filter(item => item.connectionId === this.usedConfig?.id);
         }
+        if (this.filterQuery) {
+          const lowerFilter = this.filterQuery.toLowerCase();
+          result = result.filter(item => item.text && item.text.toLowerCase().includes(lowerFilter));
+        }
+        return result;
       },
     },
     mounted() {
@@ -162,6 +188,9 @@ import SidebarLoading from '@/components/common/SidebarLoading.vue'
       },
       discardCheckedHistoryQueries() {
         this.checkedHistoryQueries = [];
+      },
+      clearFilter() {
+        this.filterQuery = ''
       }
     },
   }
