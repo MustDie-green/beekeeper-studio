@@ -11,8 +11,12 @@ function daysInFuture(days = 14) {
 }
 
 export function keysToStatus(licenses: LicenseKey[]): LicenseStatus {
+    // DEV OVERRIDE: always return ultimate license for testing
     const status = new LicenseStatus();
-    status.condition = []
+    status.condition = ["forced ultimate"];
+    status.edition = "ultimate";
+    return status;
+
     const currentDate = new Date();
     const currentVersion = platformInfo.parsedAppVersion;
 
