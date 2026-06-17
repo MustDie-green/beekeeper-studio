@@ -2,6 +2,7 @@ import { DataSource } from "typeorm"
 import { SavedConnection } from "./models/saved_connection"
 import { UsedConnection } from "./models/used_connection"
 import { UsedQuery } from './models/used_query'
+import { UsedQueryCache } from './models/used_query_cache'
 import { FavoriteQuery } from './models/favorite_query'
 import { UserSetting } from './models/user_setting'
 import { LoggerOptions } from 'typeorm/logger/LoggerOptions'
@@ -42,6 +43,7 @@ const models = [
   FormatterPreset,
   QueryFolder,
   ConnectionFolder,
+  UsedQueryCache,
 ]
 
 interface IConnectionState {
@@ -69,6 +71,26 @@ export default class Connection {
     })
     await this.connection.initialize()
     ConnectionState.connection = this
+
+    // Initialize cache table without migrations
+    await this.connection.query(`
+      CREATE TABLE IF NOT EXISTS used_query_cache (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        usedQueryId INTEGER NOT NULL,
+        cachedResults TEXT NOT NULL,
+        createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+        version INTEGER NOT NULL DEFAULT 1
+      )
+    `);
+    await this.connection.query(`CREATE INDEX IF NOT EXISTS "IDX_used_query_cache_usedQueryId" ON "used_query_cache" ("usedQueryId")`);
+
+    // Clean up old cache (older than 1 month)
+    try {
+      await this.connection.query(`DELETE FROM used_query_cache WHERE createdAt < datetime('now', '-1 month')`);
+    } catch (e) {
+      console.log('Failed to clean up query history cache', e);
+    }
   }
 
   async disconnect() {
