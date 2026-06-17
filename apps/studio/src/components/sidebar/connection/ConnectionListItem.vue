@@ -2,7 +2,7 @@
   <div
     class="list-item"
     :title="title"
-    @contextmenu.stop.prevent="showContextMenu"
+    @contextmenu.prevent="showContextMenu"
   >
     <a
       href=""
@@ -14,20 +14,25 @@
       <span :class="`connection-label connection-label-color-${labelColor}`" />
       <div class="connection-title flex-col expand">
         <div class="title">
-          {{ label }}
+          <editable-text
+            :initial-value="label"
+            :rename="rename"
+            @submit="submitRename"
+            @cancel="rename = false"
+          />
         </div>
         <div class="subtitle">
           <span
             class="bastion"
-            v-if="this.config.sshBastionHost && !privacyMode"
+            v-if="displayConfig.sshBastionHost && !privacyMode"
           >
-            <span class="truncate">{{ this.config.sshBastionHost }}</span>&nbsp;>&nbsp;
+            <span class="truncate">{{ displayConfig.sshBastionHost }}</span>&nbsp;>&nbsp;
           </span>
           <span
             class="ssh"
-            v-if="this.config.sshHost && !privacyMode"
+            v-if="displayConfig.sshHost && !privacyMode"
           >
-            <span class="truncate">{{ this.config.sshHost }}</span>&nbsp;>&nbsp;
+            <span class="truncate">{{ displayConfig.sshHost }}</span>&nbsp;>&nbsp;
           </span>
           <span class="connection">
             <span>
@@ -36,7 +41,7 @@
           </span>
         </div>
       </div>
-      <span class="badge"><span>{{ config.connectionType }}</span></span>
+      <span class="badge"><span>{{ displayConfig.connectionType }}</span></span>
       <span
         v-if="!isRecentList"
         class="actions"
@@ -73,8 +78,10 @@
 import TimeAgo from 'javascript-time-ago'
 import { mapGetters, mapState } from 'vuex'
 import { isUltimateType } from '@/common/interfaces/IConnection'
+import EditableText from '@/components/common/EditableText.vue'
 
 export default {
+  components: { EditableText },
   // recent list is 'recent connections'
   // if that is true, we need to find the companion saved connection
   props: [
@@ -87,7 +94,8 @@ export default {
   ],
   data: () => ({
     timeAgo: new TimeAgo('en-US'),
-    split: null
+    split: null,
+    rename: false,
   }),
   computed: {
     ...mapState('data/connections', {'connectionConfigs': 'items'}),
@@ -121,16 +129,16 @@ export default {
     label() {
       if (this.savedConnection && this.savedConnection.name && this.savedConnection.name.trim()) {
         return this.savedConnection.name
-      } else if ((this.config.connectionType === 'sqlite' || this.config.connectionType === 'libsql') && this.config.defaultDatabase) {
-        return window.main.basename(this.config.defaultDatabase)
-      } else if (this.config.connectionType === 'sqlanywhere' && this.config.sqlAnywhereOptions?.mode === 'file' && this.config.sqlAnywhereOptions?.databaseFile) {
-        return window.main.basename(this.config.sqlAnywhereOptions.databaseFile);
+      } else if ((this.displayConfig.connectionType === 'sqlite' || this.displayConfig.connectionType === 'libsql') && this.displayConfig.defaultDatabase) {
+        return window.main.basename(this.displayConfig.defaultDatabase)
+      } else if (this.displayConfig.connectionType === 'sqlanywhere' && this.displayConfig.sqlAnywhereOptions?.mode === 'file' && this.displayConfig.sqlAnywhereOptions?.databaseFile) {
+        return window.main.basename(this.displayConfig.sqlAnywhereOptions.databaseFile);
       }
 
-      return this.$bks.simpleConnectionString(this.config)
+      return this.$bks.simpleConnectionString(this.displayConfig)
     },
     connectionType() {
-      if (this.config.connectionType === 'sqlite' || this.config.connectionType === 'libsql') {
+      if (this.displayConfig.connectionType === 'sqlite' || this.displayConfig.connectionType === 'libsql') {
         return 'path'
       }
 
@@ -140,13 +148,13 @@ export default {
       if (this.isRecentList) {
         return this.timeAgo.format(this.config.updatedAt)
       } else {
-        return this.$bks.simpleConnectionString(this.config)
+        return this.$bks.simpleConnectionString(this.displayConfig)
       }
     },
     title() {
       return this.privacyMode ?
         'Connection details hidden by Privacy Mode' :
-        this.$bks.buildConnectionString(this.config)
+        this.$bks.buildConnectionString(this.displayConfig)
     },
     savedConnection() {
 
@@ -161,12 +169,27 @@ export default {
         return this.config
       }
     },
+    // For display purposes only: prefer the linked saved connection when this
+    // is a recent-list row, so edits to the saved connection (host, port, ssh,
+    // etc.) propagate to the recent connections list. Falls back to the
+    // used_connection snapshot when the saved connection is gone (orphan
+    // recent entry).
+    displayConfig() {
+      return this.savedConnection || this.config
+    },
   },
   methods: {
     showContextMenu(event) {
+      // Stop here and propagate the event if right clicking an input element
+      if (event.target.tagName === 'INPUT') {
+        return;
+      }
+
+      event.stopPropagation();
+
       const ultimateCheck = this.$store.getters.isUltimate
         ? true
-        : !isUltimateType(this.config.connectionType)
+        : !isUltimateType(this.displayConfig.connectionType)
 
       const options = [
         {
@@ -182,6 +205,13 @@ export default {
         !this.isRecentList && {
           name: this.pinned ? 'Unpin' : 'Pin',
           handler: () => this.pinned ? this.unpin() : this.pin()
+        },
+        !this.isRecentList && {
+          name: "Rename",
+          slug: 'rename',
+          handler: () => {
+            this.rename = true;
+          },
         },
         {
           name: "Duplicate",
@@ -252,7 +282,7 @@ export default {
     },
     async copyUrl() {
       try {
-        await this.$copyText(this.$bks.buildConnectionString(this.config))
+        await this.$copyText(this.$bks.buildConnectionString(this.displayConfig))
         this.$noty.success(`The ${this.connectionType} was successfully copied!`)
       } catch (err) {
         this.$noty.success(`The ${this.connectionType} could not be copied!`)
@@ -263,8 +293,37 @@ export default {
     },
     unpin() {
       this.$store.dispatch('pinnedConnections/remove', this.config);
-    }
+    },
+    async submitRename(name) {
+      if (!name || name === this.label) {
+        this.rename = false
+        return
+      }
+      try {
+        const updated = { ...this.savedConnection, name }
+        await this.$store.dispatch('data/connections/save', updated)
+      } catch (ex) {
+        this.$noty.error(`Rename error: ${ex.userMessage ?? ex.message}`)
+      } finally {
+        this.rename = false
+      }
+    },
   }
 
 }
 </script>
+<style lang="scss" scoped>
+.list-item .list-item-btn .connection-title {
+  min-width: 0;
+
+  .title {
+    position: relative;
+    width: 100%;
+    overflow: visible;
+  }
+
+  .editable-text {
+    width: 100%;
+  }
+}
+</style>
