@@ -1,0 +1,103 @@
+name: Fork Release
+
+# Собирает неподписанные сборки для вашего форка и кладёт их в Releases.
+# НЕ зависит от секретов upstream и не публикует ничего в оригинальный репозиторий.
+#
+# Как выпустить релиз:
+#   1) git tag v5.8.1-fork.1   (любой тег, начинающийся с "v")
+#   2) git push origin v5.8.1-fork.1
+# или вручную: вкладка Actions -> Fork Release -> Run workflow (укажите имя тега).
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Имя тега/релиза, напр. v5.8.1-fork.1 (для ручного запуска)"
+        required: true
+
+# Нужно, чтобы встроенный GITHUB_TOKEN мог создавать релиз и загружать ассеты.
+permissions:
+  contents: write
+
+concurrency:
+  group: fork-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Если одна платформа упадёт — остальные всё равно соберутся и зальются.
+      fail-fast: false
+      matrix:
+        # Уберите ненужные строки, чтобы не собирать лишние платформы.
+        os: [macos-14]
+    steps:
+      - name: Check out Git repository
+        uses: actions/checkout@v4
+
+      - name: Install python 3.11 (not Mac)
+        if: "!startsWith(matrix.os, 'macos')"
+        uses: actions/setup-python@v5
+        with:
+          python-version: 3.11
+
+      - name: Install python 3.11 (Mac)
+        if: startsWith(matrix.os, 'macos')
+        run: |
+          brew install python@3.11
+          echo "/opt/homebrew/opt/python@3.11/libexec/bin" >> $GITHUB_PATH
+
+      - name: Install fpm (Linux)
+        if: startsWith(matrix.os, 'ubuntu')
+        run: sudo gem install fpm -v 1.17.0
+
+      - name: Install Node.js, NPM and Yarn
+        uses: actions/setup-node@v3
+        with:
+          node-version-file: '.nvmrc'
+
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile --network-timeout 100000
+        env:
+          npm_config_node_gyp: ${{ github.workspace }}${{ runner.os == 'Windows' && '\node_modules\node-gyp\bin\node-gyp.js' || '/node_modules/node-gyp/bin/node-gyp.js' }}
+
+      # --publish never => electron-builder просто кладёт файлы в dist_electron,
+      # ничего никуда сам не загружает. Заливку делаем ниже своим шагом.
+      - name: Build (Linux, AppImage + deb)
+        if: startsWith(matrix.os, 'ubuntu')
+        run: yarn run electron:build --publish never --linux AppImage deb
+        env:
+          USE_SYSTEM_FPM: true
+
+      - name: Build (Windows, nsis .exe)
+        if: startsWith(matrix.os, 'windows')
+        run: yarn run electron:build --publish never --win nsis
+
+      # CSC_IDENTITY_AUTO_DISCOVERY=false => не пытаться подписывать (у форка нет сертификата).
+      # Сборка будет неподписанной: при первом запуске на macOS нужно ПКМ -> Open
+      # или снять карантин: xattr -cr "/Applications/Beekeeper Studio.app"
+      - name: Build (macOS, unsigned .dmg)
+        if: startsWith(matrix.os, 'macos')
+        run: yarn run electron:build --publish never --mac dmg
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+          PYTHON_PATH: /opt/homebrew/opt/python@3.11/libexec/bin/python3
+
+      - name: Publish assets to fork release
+        uses: softprops/action-gh-release@v2
+        with:
+          # При пуше тега берём имя тега; при ручном запуске — введённое значение.
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
+          name: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: false
+          files: |
+            apps/studio/dist_electron/*.AppImage
+            apps/studio/dist_electron/*.deb
+            apps/studio/dist_electron/*.exe
+            apps/studio/dist_electron/*.dmg
