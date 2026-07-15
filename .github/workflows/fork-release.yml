@@ -103,17 +103,25 @@ jobs:
           MAC_CERT_P12_BASE64: ${{ secrets.MAC_CERT_P12_BASE64 }}
         run: echo "$MAC_CERT_P12_BASE64" | base64 --decode > ~/mac-certificate.p12
 
-      # С сертификатом: подпись Developer ID + нотаризация (карантин не мешает).
       # Без сертификата (CSC_IDENTITY_AUTO_DISCOVERY=false): сборка неподписанная,
       # при первом запуске нужно ПКМ -> Open или снять карантин:
       #   xattr -cr "/Applications/Beekeeper Studio.app"
       # (либо скачивать через curl — см. описание релиза).
-      - name: Build (macOS, .dmg)
-        if: startsWith(matrix.os, 'macos')
+      # Отдельный шаг, а не общий с пустыми env: electron-builder воспринимает
+      # заданный, но пустой CSC_LINK/APPLE_ID как реальные значения и падает.
+      - name: Build (macOS, unsigned .dmg)
+        if: startsWith(matrix.os, 'macos') && env.HAS_MAC_CERT != 'true'
         run: yarn run electron:build --publish never --mac dmg
         env:
-          CSC_IDENTITY_AUTO_DISCOVERY: ${{ env.HAS_MAC_CERT }}
-          CSC_LINK: ${{ env.HAS_MAC_CERT == 'true' && '~/mac-certificate.p12' || '' }}
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+          PYTHON_PATH: /opt/homebrew/opt/python@3.11/libexec/bin/python3
+
+      # С сертификатом: подпись Developer ID + нотаризация (карантин не мешает).
+      - name: Build (macOS, signed .dmg)
+        if: startsWith(matrix.os, 'macos') && env.HAS_MAC_CERT == 'true'
+        run: yarn run electron:build --publish never --mac dmg
+        env:
+          CSC_LINK: "~/mac-certificate.p12"
           CSC_KEY_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
