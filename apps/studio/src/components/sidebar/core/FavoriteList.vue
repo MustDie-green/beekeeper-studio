@@ -74,16 +74,17 @@
         />
         <sidebar-loading v-if="loading" />
         <nav
-          v-else-if="filteredQueries.length > 0"
+          v-else-if="!empty"
           class="list-body"
           ref="wrapper"
         >
           <sidebar-folder
-            v-for="({ folder, queries, subfolders }) in foldersWithQueries"
-            :key="`${folder.id}-${queries.length}`"
+            v-for="({ folder, items, subfolders }) in foldersWithQueries"
+            :key="`${folder.id}-${items.length}`"
             :name="folder.name"
-            :children-count="queries.length"
+            :children-count="items.length"
             :rename="renamingFolderId === folder.id"
+            :empty="items.length === 0 && subfolders.length === 0"
             :expanded-initially="getFolderExpanded(folder.id)"
             @toggle="onFolderToggle(folder.id, $event)"
             @contextmenu.native.prevent="showFolderContextMenu($event, folder)"
@@ -92,15 +93,15 @@
             @rename-cancel="renamingFolderId = null"
           >
             <Draggable
-              :list="queries"
+              :list="items"
               group="queries"
               ghost-class="drag-ghost"
-              @start="onQueryDragStart($event, queries)"
+              @start="onQueryDragStart($event, items)"
               @end="draggingQuery = null"
-              @change="onQueryDrop($event, folder, queries)"
+              @change="onQueryDrop($event, folder, items)"
             >
               <favorite-list-item
-                v-for="item in queries"
+                v-for="item in items"
                 :key="item.id"
                 :item="item"
                 :active="isActive(item)"
@@ -115,11 +116,12 @@
               />
             </Draggable>
             <sidebar-folder
-              v-for="({ folder: subfolder, queries: subQueries }) in subfolders"
+              v-for="({ folder: subfolder, items: subQueries }) in subfolders"
               :key="`${subfolder.id}-${subQueries.length}`"
               :name="subfolder.name"
               :children-count="subQueries.length"
               :rename="renamingFolderId === subfolder.id"
+              :empty="subQueries.length === 0"
               :expanded-initially="getFolderExpanded(subfolder.id)"
               @toggle="onFolderToggle(subfolder.id, $event)"
               @contextmenu.native.prevent="showFolderContextMenu($event, subfolder)"
@@ -253,6 +255,7 @@ import SidebarLoading from '../../common/SidebarLoading.vue'
 import FavoriteListItem from './favorite_list/FavoriteListItem.vue'
 import SidebarFolder from '@/components/common/SidebarFolder.vue'
 import { AppEvent } from '@/common/AppEvent'
+import { getLonelyItems, isFolderListEmpty } from '@/common/utils/folderTree'
 import Draggable from 'vuedraggable'
 
 export default {
@@ -305,10 +308,10 @@ export default {
       return this.$store.getters['data/queryFolders/foldersWithQueries'](this.filteredQueries)
     },
     lonelyQueries() {
-      const folderIds = this.folders.map((f) => f.id)
-      return [...this.filteredQueries]
-        .filter((query) => !query.queryFolderId || !folderIds.includes(query.queryFolderId))
-        .sort((a, b) => (a.position ?? 0) - (b.position ?? 0))
+      return getLonelyItems(this.folders, this.filteredQueries, 'queryFolderId')
+    },
+    empty() {
+      return isFolderListEmpty(this.filteredQueries, this.folders)
     },
     removeTitle() {
       return `Remove ${this.checkedFavorites.length} saved queries`;
@@ -366,7 +369,7 @@ export default {
       this.trigger('favoriteClick', item, { openHistory: true })
     },
     async remove(favorite) {
-      if (await this.$confirm("Really delete?")) {
+      if (await this.$confirm(`Delete "${favorite.name}"?`, undefined, { variant: "danger" })) {
         await this.$store.dispatch('data/queries/remove', favorite)
       }
     },
@@ -402,16 +405,14 @@ export default {
       if (this.isCloud && !folder.parentId) {
         options.push({ name: 'New Subfolder', handler: ({ item }) => this.createSubfolder(item) })
       }
-      if (folder.parentId) {
-        const otherRoots = this.rootFolders.filter(f => f.id !== folder.parentId)
-        otherRoots.forEach(root => {
-          options.push({ name: `Move to ${root.name}`, handler: ({ item }) => this.moveFolderToParent(item, root) })
-        })
-      }
-      options.push(
+      options.push(...[
         { name: 'Rename', handler: ({ item }) => this.renameQueryFolder(item) },
+        folder.parentId && {
+          name: 'Move',
+          handler: ({ item }) => this.trigger(AppEvent.openMoveFileModal, { type: 'queryFolder', value: item }),
+        },
         { name: 'Delete', handler: ({ item }) => this.deleteFolder(item) }
-      )
+      ].filter(Boolean))
       this.$bks.openMenu({ event, item: folder, options })
     },
     createSubfolder(parentFolder) {
@@ -453,9 +454,6 @@ export default {
       } finally {
         this.renamingFolderId = null
       }
-    },
-    async moveFolderToParent(folder, newParent) {
-      await this.$store.dispatch('data/queryFolders/save', { ...folder, parentId: newParent.id })
     },
     async deleteFolder(folder) {
       if (await this.$confirm(`Delete folder "${folder.name}"?`)) {
