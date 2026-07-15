@@ -1,4 +1,4 @@
-import { AzureAuthOptions, BigQueryOptions, CassandraOptions, DynamoDBOptions, LibSQLOptions, RedshiftOptions, ConnectionType, SQLAnywhereOptions, IamAuthOptions, SurrealDBOptions, SnowflakeOptions } from "@/lib/db/types"
+import { AzureAuthOptions, BigQueryOptions, CassandraOptions, DynamoDBOptions, LibSQLOptions, RedshiftOptions, ConnectionType, SQLAnywhereOptions, IamAuthOptions, SurrealDBOptions, SnowflakeOptions, TrinoOptions } from "@/lib/db/types"
 import { Transport } from "../transport"
 
 export type SshMode = null | 'agent' | 'userpass' | 'keyfile'
@@ -66,6 +66,7 @@ export interface ISimpleConnection extends Transport {
   surrealDbOptions?: SurrealDBOptions
   dynamoDbOptions?: DynamoDBOptions
   snowflakeOptions?: SnowflakeOptions
+  trinoOptions?: TrinoOptions
   connectionFolderId?: Nullable<number>
   position?: number
 }

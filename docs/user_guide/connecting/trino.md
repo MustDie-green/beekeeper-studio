@@ -37,6 +37,19 @@ If your Trino coordinator is configured with TLS/HTTPS, enable **SSL** in the co
 !!! tip
     If you import a connection URL that starts with `https://`, SSL will be enabled automatically.
 
+### OAuth2 / SSO Authentication
+
+If your Trino coordinator uses OAuth2 authentication (`http-server.authentication.type=oauth2`), select **OAuth2 with Browser** as the Authentication Method:
+
+1. Select **OAuth2 with Browser** in the Authentication Method dropdown.
+2. Fill in the host and port (OAuth2 requires HTTPS, so enable SSL).
+3. Click *Connect* — the identity provider's sign-in page opens in the default browser.
+4. Complete the sign-in; the connection is established automatically once the token is issued.
+
+The **User** field is optional with OAuth2 — the username is derived from the issued token. If set, it is sent as the `X-Trino-User` header (useful for user impersonation setups).
+
+When the token expires mid-session, the browser sign-in reopens on the next query.
+
 ### Testing Your Trino Connection
 
 Before saving your connection details, Beekeeper Studio allows you to test the connection:
@@ -52,6 +65,7 @@ Once your connection details have been verified, you can choose to save them by 
 ## Supported Features
 
 - SSL / HTTPS connections (with optional CA, client cert, and key files)
+- OAuth2 / SSO authentication via the browser
 - Table data view
 - Table data sorting, filtering
 - Table structure view

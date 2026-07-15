@@ -92,6 +92,7 @@ import cleanupDuplicateLicenseKeys from './20260421_cleanup_duplicate_license_ke
 import createTabulatorPersistence from './20260424_create_tabulator_persistence'
 import clearLogFiles from './20260527_clear_log_files'
 import addSnowflakeOptions from './20260501_add_snowflake_options'
+import addTrinoOptions from './20260715_add_trino_options'
 
 import ultimate from './ultimate/index'
 
@@ -144,7 +145,8 @@ const realMigrations = [
   cleanupDuplicateLicenseKeys,
   createTabulatorPersistence,
   clearLogFiles,
-  addSnowflakeOptions
+  addSnowflakeOptions,
+  addTrinoOptions
 ]
 
 // fixtures require the models

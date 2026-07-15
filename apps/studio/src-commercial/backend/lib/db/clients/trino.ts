@@ -1,6 +1,9 @@
 import rawLog from "@bksLogger"
 import { readFileSync } from "fs"
-import { IDbConnectionDatabase } from "@/lib/db/types"
+import { Agent as HttpsAgent } from "https"
+import axios from "axios"
+import { wait } from "@shared/lib/wait"
+import { IDbConnectionDatabase, TrinoAuthType } from "@/lib/db/types"
 import {
   Trino as TrinoNodeClient,
   BasicAuth,
@@ -66,6 +69,8 @@ interface TrinoResult extends BaseQueryResult {
 
 const log = rawLog.scope("trino")
 const knex = null
+// How long to wait for the user to finish signing in on the browser
+const OAUTH2_LOGIN_TIMEOUT_MS = 5 * 60 * 1000
 const trinoContext = {
   getExecutionContext(): ExecutionContext {
     return null;
@@ -79,6 +84,8 @@ export class TrinoClient extends BasicDatabaseClient<TrinoResult> {
   version: string
   client: any
   supportsTransaction: boolean
+  private serverUrl: string
+  private connectionOptions: TrinoConnectionOptions
 
   constructor(server: IDbConnectionServer, database: IDbConnectionDatabase) {
     super(knex, trinoContext, server, database)
@@ -95,7 +102,6 @@ export class TrinoClient extends BasicDatabaseClient<TrinoResult> {
     await super.connect()
 
     let url: string
-    let connectionObj = {} as TrinoConnectionOptions
 
     if (this.server.config.url) {
       url = this.server.config.url
@@ -107,39 +113,25 @@ export class TrinoClient extends BasicDatabaseClient<TrinoResult> {
       url = urlObj.toString()
     }
 
-    connectionObj = {
+    const sslOptions = this.buildSslOptions()
+
+    let authOptions: Partial<TrinoConnectionOptions> = {}
+    if (this.useOAuth) {
+      const token = await this.fetchOAuth2Token(url, sslOptions)
+      authOptions = { extraHeaders: this.oauthHeaders(token) }
+    } else if ((this.server.config.user != null && this.server.config.user !== '') || (this.server.config.password != null && this.server.config.password !== '')) {
+      authOptions = { auth: new BasicAuth(this.server.config.user, this.server.config.password) }
+    }
+
+    const connectionObj: TrinoConnectionOptions = {
       server: url,
-      catalog: this.database.database
-    }
-    
-    if (this.server.config.ssl) {
-      const sslOptions: SecureContextOptions = {}
-
-      if (this.server.config.sslCaFile) {
-        sslOptions.ca = readFileSync(this.server.config.sslCaFile)
-      }
-
-      if (this.server.config.sslCertFile) {
-        sslOptions.cert = readFileSync(this.server.config.sslCertFile)
-      }
-
-      if (this.server.config.sslKeyFile) {
-        sslOptions.key = readFileSync(this.server.config.sslKeyFile)
-      }
-
-      if (!sslOptions.key && !sslOptions.ca && !sslOptions.cert) {
-        sslOptions.rejectUnauthorized = false
-      } else {
-        sslOptions.rejectUnauthorized = this.server.config.sslRejectUnauthorized
-      }
-
-      connectionObj.ssl = sslOptions
+      catalog: this.database.database,
+      ssl: sslOptions,
+      ...authOptions
     }
 
-    if ((this.server.config.user != null && this.server.config.user !== '') || (this.server.config.password != null && this.server.config.password !== '')) {
-      connectionObj.auth = new BasicAuth(this.server.config.user, this.server.config.password)
-    }
-
+    this.serverUrl = url
+    this.connectionOptions = connectionObj
     this.client = TrinoNodeClient.create(connectionObj)
     const result = await this.driverExecuteSingle(
       "SELECT version()"
@@ -147,6 +139,111 @@ export class TrinoClient extends BasicDatabaseClient<TrinoResult> {
 
     this.version = result.rows[0]['_col0']
     this.supportsTransaction = false
+  }
+
+  private get useOAuth(): boolean {
+    return this.server.config.trinoOptions?.authType === TrinoAuthType.OAuth2
+  }
+
+  private buildSslOptions(): SecureContextOptions | undefined {
+    if (!this.server.config.ssl) return undefined
+
+    const { sslCaFile, sslCertFile, sslKeyFile } = this.server.config
+    const ca = sslCaFile ? readFileSync(sslCaFile) : undefined
+    const cert = sslCertFile ? readFileSync(sslCertFile) : undefined
+    const key = sslKeyFile ? readFileSync(sslKeyFile) : undefined
+
+    return {
+      ca,
+      cert,
+      key,
+      rejectUnauthorized: (ca || cert || key)
+        ? this.server.config.sslRejectUnauthorized
+        : false
+    }
+  }
+
+  private oauthHeaders(token: string): Record<string, string> {
+    return {
+      Authorization: `Bearer ${token}`,
+      // With OAuth2 the user comes from the token. Overriding the library's
+      // default (the OS user) avoids impersonation errors; an empty value
+      // gets stripped by the client, dropping the header entirely.
+      'X-Trino-User': this.server.config.user || ''
+    }
+  }
+
+  /**
+   * Implements the Trino OAuth2 handshake, same as the Python client and JDBC
+   * driver: an unauthenticated request returns a 401 whose WWW-Authenticate
+   * header carries a URL to open in the browser (x_redirect_server) and a URL
+   * to long-poll for the resulting token (x_token_server).
+   */
+  private async fetchOAuth2Token(serverUrl: string, ssl?: SecureContextOptions): Promise<string> {
+    const httpsAgent = new HttpsAgent(ssl ?? {})
+    const statementUrl = new URL('v1/statement', serverUrl).toString()
+
+    const challenge = await axios.post(statementUrl, 'SELECT 1', {
+      httpsAgent,
+      validateStatus: () => true
+    })
+
+    if (challenge.status !== 401) {
+      throw new Error(`Expected an authentication challenge from the Trino server, got HTTP ${challenge.status}. Check that the server has OAuth2 authentication enabled.`)
+    }
+
+    const wwwAuthenticate = challenge.headers['www-authenticate'] || ''
+    const redirectMatch = wwwAuthenticate.match(/x_redirect_server="([^"]+)"/i)
+    const tokenMatch = wwwAuthenticate.match(/x_token_server="([^"]+)"/i)
+
+    if (!redirectMatch || !tokenMatch) {
+      throw new Error(`The Trino server did not offer OAuth2 authentication (WWW-Authenticate: ${wwwAuthenticate || 'missing'})`)
+    }
+
+    log.info('Opening browser for Trino OAuth2 sign-in')
+    process.parentPort.postMessage({ type: 'openExternal', url: redirectMatch[1] })
+
+    let tokenUrl = tokenMatch[1]
+    const deadline = Date.now() + OAUTH2_LOGIN_TIMEOUT_MS
+
+    while (Date.now() < deadline) {
+      const res = await axios.get(tokenUrl, {
+        httpsAgent,
+        validateStatus: () => true
+      })
+
+      if (res.status !== 200) {
+        throw new Error(`Trino OAuth2 token request failed with HTTP ${res.status}`)
+      }
+
+      if (res.data?.token) {
+        return res.data.token
+      }
+
+      if (res.data?.error) {
+        throw new Error(`Trino OAuth2 authentication failed: ${res.data.error}`)
+      }
+
+      if (res.data?.nextUri) {
+        // The token server long-polls; the small delay just avoids a hot loop
+        tokenUrl = res.data.nextUri
+        await wait(500)
+        continue
+      }
+
+      throw new Error('Unexpected response from the Trino OAuth2 token server')
+    }
+
+    throw new Error('Timed out waiting for the browser sign-in to complete')
+  }
+
+  private async refreshOAuthSession(): Promise<void> {
+    const token = await this.fetchOAuth2Token(this.serverUrl, this.connectionOptions.ssl)
+    this.connectionOptions = {
+      ...this.connectionOptions,
+      extraHeaders: this.oauthHeaders(token)
+    }
+    this.client = TrinoNodeClient.create(this.connectionOptions)
   }
 
   async disconnect(): Promise<void> {
@@ -432,7 +529,7 @@ export class TrinoClient extends BasicDatabaseClient<TrinoResult> {
     return results
   }
 
-  async rawExecuteQuery(sql: string): Promise<TrinoResult> {
+  async rawExecuteQuery(sql: string, options: any = {}): Promise<TrinoResult> {
     try {
       // The trino query parser doesn't particularly like semicolons. Who can blame it?
       const result: AsyncIterableIterator<QueryResult> = await this.client.query(sql.trim().replace(/;$/, ''))
@@ -462,6 +559,12 @@ export class TrinoClient extends BasicDatabaseClient<TrinoResult> {
         arrayMode: false
       }
     } catch (err) {
+      // OAuth2 tokens expire; re-run the browser sign-in once and retry
+      if (this.useOAuth && err?.response?.status === 401 && !options._oauthRetried) {
+        log.info('Trino OAuth2 token expired, re-authenticating')
+        await this.refreshOAuthSession()
+        return await this.rawExecuteQuery(sql, { ...options, _oauthRetried: true })
+      }
       log.error(err)
       throw err
     }

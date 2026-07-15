@@ -197,6 +197,20 @@ export interface SnowflakeOptions {
   passcode?: string;
 }
 
+export enum TrinoAuthType {
+  Basic = 'basic',
+  OAuth2 = 'oauth2'
+}
+
+export const TrinoAuthTypes = [
+  { name: 'Username / Password', value: TrinoAuthType.Basic },
+  { name: 'OAuth2 with Browser', value: TrinoAuthType.OAuth2 }
+]
+
+export interface TrinoOptions {
+  authType?: TrinoAuthType;
+}
+
 export enum SurrealAuthType {
   Root,
   Namespace,
@@ -292,6 +306,7 @@ export interface IDbConnectionServerConfig {
   surrealDbOptions?: SurrealDBOptions
   dynamoDbOptions?: DynamoDBOptions
   snowflakeOptions?: SnowflakeOptions
+  trinoOptions?: TrinoOptions
   runtimeExtensions?: string[]
 }
 
