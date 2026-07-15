@@ -56,6 +56,10 @@
           this.$set(this.config, 'trinoOptions', {})
         }
         this.config.trinoOptions.authType = this.authType
+        // Trino only serves the OAuth2 flow over HTTPS
+        if (this.authType === TrinoAuthType.OAuth2 && !this.config.ssl) {
+          this.config.ssl = true
+        }
       }
     }
   }

@@ -145,6 +145,33 @@ describe('TrinoClient SSL configuration (bug #3695)', () => {
   })
 })
 
+describe('TrinoClient read-only mode', () => {
+  let client: TrinoClient
+
+  beforeEach(async () => {
+    jest.clearAllMocks()
+    capturedQueries.length = 0
+    client = new TrinoClient(makeServer({ readOnlyMode: true }), makeDatabase())
+    await client.connect()
+    capturedQueries.length = 0
+  })
+
+  it('should allow SHOW CATALOGS (listDatabases) in read-only mode', async () => {
+    await expect(client.listDatabases()).resolves.toBeDefined()
+    expect(capturedQueries[0]).toContain('show catalogs')
+  })
+
+  it('should allow SHOW SCHEMAS (listSchemas) in read-only mode', async () => {
+    await expect(client.listSchemas(null)).resolves.toBeDefined()
+    expect(capturedQueries[0]).toContain('show schemas')
+  })
+
+  it('should still block writes in read-only mode', async () => {
+    await expect(client.driverExecuteSingle('DELETE FROM users'))
+      .rejects.toThrow(/Read-Only Mode/)
+  })
+})
+
 describe('TrinoClient SQL escaping', () => {
   let client: TrinoClient
 

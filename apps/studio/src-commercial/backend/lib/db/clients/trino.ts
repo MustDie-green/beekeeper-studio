@@ -189,7 +189,12 @@ export class TrinoClient extends BasicDatabaseClient<TrinoResult> {
     })
 
     if (challenge.status !== 401) {
-      throw new Error(`Expected an authentication challenge from the Trino server, got HTTP ${challenge.status}. Check that the server has OAuth2 authentication enabled.`)
+      const body = typeof challenge.data === 'string' ? challenge.data : JSON.stringify(challenge.data ?? '')
+      const usingHttps = statementUrl.startsWith('https:')
+      const hint = usingHttps
+        ? 'Check that the server has OAuth2 authentication enabled.'
+        : 'Trino OAuth2 requires HTTPS — enable SSL in the connection settings.'
+      throw new Error(`Expected an authentication challenge from the Trino server, got HTTP ${challenge.status}. ${hint} Server response: ${body.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 200)}`)
     }
 
     const wwwAuthenticate = challenge.headers['www-authenticate'] || ''
@@ -827,8 +832,14 @@ export class TrinoClient extends BasicDatabaseClient<TrinoResult> {
   }
 
   protected violatesReadOnly(statements: IdentifyResult[], options: any = {}) {
+    // The sql-query-identifier 'generic' dialect can't parse Trino metadata
+    // commands (SHOW CATALOGS, SHOW SCHEMAS FROM, DESCRIBE, ...) and marks
+    // them UNKNOWN, which read-only mode would block even though they only
+    // read. Filter them out before delegating to the base check.
+    const readOnlyStatement = /^\s*(show|describe|desc|explain)\b/i
+    const remaining = statements.filter(s => !readOnlyStatement.test(s.text))
     return (
-      super.violatesReadOnly(statements, options) ||
+      super.violatesReadOnly(remaining, options) ||
       (this.readOnlyMode && options.insert)
     )
   }
