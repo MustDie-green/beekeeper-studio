@@ -8,6 +8,7 @@ import {
   Trino as TrinoNodeClient,
   BasicAuth,
   QueryResult,
+  QueryError,
   ConnectionOptions as TrinoConnectionOptions,
   SecureContextOptions
 } from 'trino-client'
@@ -534,6 +535,15 @@ export class TrinoClient extends BasicDatabaseClient<TrinoResult> {
     return results
   }
 
+  private buildTrinoError(error: QueryError): Error {
+    // errorName is the machine code (e.g. COLUMN_NOT_FOUND, TABLE_NOT_FOUND);
+    // message carries the human-readable detail with line/column info.
+    const parts = [error.errorName, error.message].filter(Boolean)
+    const err = new Error(parts.join(': ') || 'Trino query failed')
+      ; (err as any).trinoError = error
+    return err
+  }
+
   async rawExecuteQuery(sql: string, options: any = {}): Promise<TrinoResult> {
     try {
       // The trino query parser doesn't particularly like semicolons. Who can blame it?
@@ -543,8 +553,16 @@ export class TrinoClient extends BasicDatabaseClient<TrinoResult> {
       const rows: any[] = []
 
       for await (const r of result) {
+        // Trino reports query failures in the response body (HTTP 200 + an
+        // `error` field), not via HTTP status, and trino-client never checks
+        // for it. Without this the loop finishes empty and a failed query
+        // looks like it returned zero rows instead of surfacing the error.
+        if (r.error) {
+          throw this.buildTrinoError(r.error)
+        }
+
         const { data: resultData, columns: resultColumns } = r
-        columns = resultColumns
+        if (resultColumns) columns = resultColumns
 
         if (resultData) rows.push(...resultData)
       }

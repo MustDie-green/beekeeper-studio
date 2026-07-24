@@ -172,6 +172,83 @@ describe('TrinoClient read-only mode', () => {
   })
 })
 
+describe('TrinoClient query error surfacing', () => {
+  let client: TrinoClient
+  // The trino-client mock hands back a shared client object, so overriding
+  // its query() leaks across tests unless restored.
+  let originalQuery: any
+
+  beforeEach(async () => {
+    jest.clearAllMocks()
+    capturedQueries.length = 0
+    client = new TrinoClient(makeServer(), makeDatabase())
+    await client.connect()
+    originalQuery = (client as any).client.query
+    capturedQueries.length = 0
+  })
+
+  afterEach(() => {
+    ;(client as any).client.query = originalQuery
+  })
+
+  // Helper: make the underlying trino-client yield an arbitrary sequence of
+  // QueryResult objects (Trino streams errors in the body, not via HTTP).
+  function stubResults(...results: any[]) {
+    ;(client as any).client.query = jest.fn().mockResolvedValue({
+      [Symbol.asyncIterator]: async function* () {
+        for (const r of results) yield r
+      }
+    })
+  }
+
+  it('throws when Trino reports an error in the response body', async () => {
+    stubResults({
+      error: {
+        message: "line 1:8: Column 'foo' cannot be resolved",
+        errorCode: 47,
+        errorName: 'COLUMN_NOT_FOUND',
+        errorType: 'USER_ERROR'
+      }
+    })
+
+    await expect(client.driverExecuteSingle('SELECT foo FROM bar'))
+      .rejects.toThrow(/COLUMN_NOT_FOUND/)
+  })
+
+  it('includes the human-readable message in the thrown error', async () => {
+    stubResults({
+      error: {
+        message: "line 1:15: Table 'x.y.z' does not exist",
+        errorCode: 1,
+        errorName: 'TABLE_NOT_FOUND',
+        errorType: 'USER_ERROR'
+      }
+    })
+
+    await expect(client.driverExecuteSingle('SELECT * FROM x.y.z'))
+      .rejects.toThrow(/does not exist/)
+  })
+
+  it('does not overwrite columns with a trailing result page that omits them', async () => {
+    // Final Trino poll can arrive without columns; earlier ones carry them.
+    stubResults(
+      { columns: [{ name: 'n', type: 'bigint' }], data: [[1]] },
+      { data: [[2]] }
+    )
+
+    const result = await client.driverExecuteSingle('SELECT n FROM t')
+    expect(result.columns).toEqual([{ name: 'n', type: 'bigint' }])
+    expect(result.rows).toEqual([{ n: 1 }, { n: 2 }])
+  })
+
+  it('still returns rows for a successful query', async () => {
+    stubResults({ columns: [{ name: 'n', type: 'bigint' }], data: [[42]] })
+
+    const result = await client.driverExecuteSingle('SELECT 42 AS n')
+    expect(result.rows).toEqual([{ n: 42 }])
+  })
+})
+
 describe('TrinoClient SQL escaping', () => {
   let client: TrinoClient
 
