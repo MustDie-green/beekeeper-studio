@@ -88,11 +88,30 @@ export class ElectronUtilityConnectionClient implements IBasicDatabaseClient {
 
   async query(queryText: string, tabId: number, options?: any, hasActiveTransaction: boolean = false): Promise<CancelableQuery> {
     const id = await Vue.prototype.$util.send('conn/query', { queryText, options, tabId, hasActiveTransaction });
+    // Listener id, so the subscription can be torn down once the query ends
+    let progressListener: string = null
+
+    const stopListening = () => {
+      if (progressListener) {
+        Vue.prototype.$util.removeListener(progressListener)
+        progressListener = null
+      }
+    }
+
     return {
+      onProgress: (callback) => {
+        stopListening()
+        progressListener = Vue.prototype.$util.addListener(`onQueryProgress/${id}`, callback)
+      },
       execute: async () => {
-        return await Vue.prototype.$util.send('query/execute', { queryId: id, isManualCommit: options?.isManualCommit })
+        try {
+          return await Vue.prototype.$util.send('query/execute', { queryId: id, isManualCommit: options?.isManualCommit })
+        } finally {
+          stopListening()
+        }
       },
       cancel: async () => {
+        stopListening()
         return await Vue.prototype.$util.send('query/cancel', { queryId: id })
       }
     }

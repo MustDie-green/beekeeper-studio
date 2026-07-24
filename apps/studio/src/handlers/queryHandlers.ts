@@ -17,6 +17,15 @@ export const QueryHandlers: IQueryHandlers = {
       throw new Error(errorMessages.noQuery);
     }
 
+    // Drivers that can report execution progress (Trino) push stats to the
+    // renderer while the query runs, so a slow query looks alive.
+    query.onProgress?.((progress) => {
+      state(sId).port.postMessage({
+        type: `onQueryProgress/${queryId}`,
+        input: progress
+      })
+    })
+
     const result = await query.execute();
     state(sId).queries.delete(queryId);
 

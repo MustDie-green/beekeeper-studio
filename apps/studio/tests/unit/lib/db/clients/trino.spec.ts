@@ -249,6 +249,170 @@ describe('TrinoClient query error surfacing', () => {
   })
 })
 
+describe('TrinoClient execution progress and cancel', () => {
+  let client: TrinoClient
+  let originalQuery: any
+
+  beforeEach(async () => {
+    jest.clearAllMocks()
+    capturedQueries.length = 0
+    client = new TrinoClient(makeServer(), makeDatabase())
+    await client.connect()
+    originalQuery = (client as any).client.query
+    capturedQueries.length = 0
+  })
+
+  afterEach(() => {
+    ;(client as any).client.query = originalQuery
+  })
+
+  function stubResults(...results: any[]) {
+    ;(client as any).client.query = jest.fn().mockResolvedValue({
+      [Symbol.asyncIterator]: async function* () {
+        for (const r of results) yield r
+      }
+    })
+  }
+
+  const statsPage = (over: any = {}) => ({
+    id: 'query_123',
+    infoUri: 'https://trino/ui/query.html?query_123',
+    stats: {
+      state: 'RUNNING',
+      progressPercentage: 40,
+      processedRows: 1000,
+      processedBytes: 2048,
+      elapsedTimeMillis: 5000,
+      queuedTimeMillis: 100,
+      completedSplits: 4,
+      runningSplits: 2,
+      totalSplits: 10,
+      nodes: 3,
+      ...over
+    }
+  })
+
+  it('reports progress for each page the engine sends', async () => {
+    stubResults(
+      statsPage(),
+      { ...statsPage({ state: 'FINISHING', progressPercentage: 100 }), columns: [{ name: 'n', type: 'bigint' }], data: [[1]] }
+    )
+
+    const seen: any[] = []
+    const query = await client.query('SELECT n FROM t')
+    query.onProgress((p) => seen.push(p))
+    await query.execute()
+
+    expect(seen.length).toBe(2)
+    expect(seen[0]).toMatchObject({
+      state: 'RUNNING',
+      percentage: 40,
+      processedRows: 1000,
+      totalSplits: 10,
+      completedSplits: 4,
+      nodes: 3,
+      driverQueryId: 'query_123'
+    })
+    expect(seen[1].state).toBe('FINISHING')
+  })
+
+  it('executes fine when nothing subscribes to progress', async () => {
+    stubResults({ ...statsPage(), columns: [{ name: 'n', type: 'bigint' }], data: [[7]] })
+
+    const query = await client.query('SELECT n FROM t')
+    await expect(query.execute()).resolves.toBeDefined()
+  })
+
+  it('cancels the running query on the server by its Trino query id', async () => {
+    const cancel = jest.fn().mockResolvedValue({})
+    ;(client as any).client.cancel = cancel
+
+    // Hold the query open so cancel lands while it is still in flight.
+    let release: () => void
+    const gate = new Promise<void>((r) => { release = r })
+    ;(client as any).client.query = jest.fn().mockResolvedValue({
+      [Symbol.asyncIterator]: async function* () {
+        yield statsPage()
+        await gate
+        yield { columns: [{ name: 'n', type: 'bigint' }], data: [[1]] }
+      }
+    })
+
+    const query = await client.query('SELECT n FROM t')
+    const running = query.execute().catch((e) => e)
+    // Let the first page (which carries the query id) arrive
+    await new Promise((r) => setTimeout(r, 10))
+
+    await query.cancel()
+    expect(cancel).toHaveBeenCalledWith('query_123')
+
+    release()
+    await running
+  })
+
+  it('reports progress for pages the library iterator never yields', async () => {
+    // Faithful to trino-client: every poll goes through Client.request, but
+    // the iterator only yields pages carrying rows — a query that sits in
+    // QUEUED/RUNNING for minutes yields nothing at all until rows appear.
+    const page = (state: string, over: any = {}) => ({
+      id: 'q1',
+      stats: { state, progressPercentage: 0, totalSplits: 0, ...over }
+    })
+
+    const polled = [page('RUNNING', { progressPercentage: 50 })]
+    const inner = {
+      request: jest.fn().mockImplementation(async () => polled.shift())
+    }
+    const fakeTrino = {
+      client: inner,
+      query: jest.fn().mockResolvedValue({
+        iter: { queryResult: page('QUEUED') },
+        [Symbol.asyncIterator]: async function* () {
+          // The skipped poll still happens, it just isn't emitted
+          await inner.request({ url: 'nextUri' })
+          yield { ...page('FINISHING'), columns: [{ name: 'n', type: 'bigint' }], data: [[1]] }
+        }
+      })
+    }
+
+    ;(client as any).client = fakeTrino
+    ;(client as any).progressTapInstalled = false
+    ;(client as any).installProgressTap(fakeTrino)
+
+    const seen: any[] = []
+    const query = await client.query('SELECT 1')
+    query.onProgress((p) => seen.push(p))
+    await query.execute()
+
+    const states = seen.map((p) => p.state)
+    // From the initial POST response
+    expect(states).toContain('QUEUED')
+    // From the poll the iterator swallowed — the whole point of the tap
+    expect(states).toContain('RUNNING')
+    expect(seen.find((p) => p.state === 'RUNNING').percentage).toBe(50)
+  })
+
+  it('stops reporting progress once the query finishes', async () => {
+    stubResults({ ...statsPage(), columns: [{ name: 'n', type: 'bigint' }], data: [[1]] })
+
+    const query = await client.query('SELECT n FROM t')
+    query.onProgress(() => { /* noop */ })
+    await query.execute()
+
+    expect((client as any).progressListeners.size).toBe(0)
+  })
+
+  it('does not call server cancel when no query id is known yet', async () => {
+    const cancel = jest.fn().mockResolvedValue({})
+    ;(client as any).client.cancel = cancel
+
+    const query = await client.query('SELECT 1')
+    await query.cancel()
+
+    expect(cancel).not.toHaveBeenCalled()
+  })
+})
+
 describe('TrinoClient SQL escaping', () => {
   let client: TrinoClient
 

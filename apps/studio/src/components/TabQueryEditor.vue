@@ -613,6 +613,8 @@ import { KeybindingPath } from '@/common/bksConfig/BksConfigProvider'
           initialized: false,
         },
         runningQuery: null,
+        // Live execution stats, for engines that report them (Trino)
+        queryProgress: null,
         error: null,
         errorMarker: null,
         saveError: null,
@@ -772,7 +774,37 @@ import { KeybindingPath } from '@/common/bksConfig/BksConfigProvider'
         return result.length ? result : null
       },
       runningText() {
-        return `Running ${this.runningType} (${this.$pluralize('query', this.runningCount, true)})`
+        const base = `Running ${this.runningType} (${this.$pluralize('query', this.runningCount, true)})`
+        return this.progressText ? `${base} — ${this.progressText}` : base
+      },
+      // Live engine stats, when the driver reports them. Absent for drivers
+      // that don't, in which case runningText stays as it always was.
+      progressText() {
+        const p = this.queryProgress
+        if (!p) return null
+
+        const parts = []
+
+        if (p.state) {
+          parts.push(p.state.charAt(0) + p.state.slice(1).toLowerCase())
+        }
+        if (_.isFinite(p.percentage) && p.state !== 'QUEUED') {
+          parts.push(`${Math.round(p.percentage)}%`)
+        }
+        if (p.totalSplits > 0) {
+          parts.push(`${p.completedSplits ?? 0}/${p.totalSplits} splits`)
+        }
+        if (p.processedRows > 0) {
+          parts.push(`${p.processedRows.toLocaleString()} rows`)
+        }
+        if (p.processedBytes > 0) {
+          parts.push(this.$options.filters.prettyBytes(p.processedBytes))
+        }
+        if (_.isFinite(p.elapsedMillis)) {
+          parts.push(this.formatElapsed(p.elapsedMillis))
+        }
+
+        return parts.join(' · ')
       },
       hasSelectedText() {
         return this.editor.initialized ? !!this.editor.selection : false
@@ -1290,11 +1322,19 @@ import { KeybindingPath } from '@/common/bksConfig/BksConfigProvider'
       close() {
         this.$root.$emit(AppEvent.closeTab)
       },
+      formatElapsed(millis) {
+        const totalSeconds = Math.floor(millis / 1000)
+        if (totalSeconds < 60) return `${totalSeconds}s`
+        const minutes = Math.floor(totalSeconds / 60)
+        if (minutes < 60) return `${minutes}m ${totalSeconds % 60}s`
+        return `${Math.floor(minutes / 60)}h ${minutes % 60}m`
+      },
       async cancelQuery() {
         if (this.running && this.runningQuery) {
           this.running = false
           this.tab.isRunning = false
           this.info = 'Query Execution Cancelled'
+          this.queryProgress = null
           await this.runningQuery.cancel();
           this.runningQuery = null;
         }
@@ -1621,6 +1661,10 @@ import { KeybindingPath } from '@/common/bksConfig/BksConfigProvider'
           this.runningCount = identification.length || 1
           // Dry run is for bigquery, allows query cost estimations
           this.runningQuery = await this.connection.query(query, this.tab.id, { dryRun: this.dryRun}, this.hasActiveTransaction);
+          this.queryProgress = null
+          this.runningQuery.onProgress?.((progress) => {
+            this.queryProgress = progress
+          })
           const queryStartTime = new Date()
           const results = await this.runningQuery.execute();
           const queryEndTime = new Date()
@@ -1694,6 +1738,7 @@ import { KeybindingPath } from '@/common/bksConfig/BksConfigProvider'
         } finally {
           this.running = false
           this.tab.isRunning = false
+          this.queryProgress = null
         }
       },
       initializeQueries() {

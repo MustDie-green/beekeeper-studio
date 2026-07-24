@@ -28,6 +28,7 @@ import {
   NgQueryResult,
   OrderBy,
   PrimaryKeyColumn,
+  QueryProgress,
   Routine,
   SchemaFilterOptions,
   StreamResults,
@@ -87,6 +88,12 @@ export class TrinoClient extends BasicDatabaseClient<TrinoResult> {
   supportsTransaction: boolean
   private serverUrl: string
   private connectionOptions: TrinoConnectionOptions
+  // Trino's own id for the query currently in flight, needed to cancel it
+  private runningQueryId: string | null = null
+  // Progress callbacks keyed by Trino query id, so concurrent queries on the
+  // shared client each get their own stats
+  private progressListeners = new Map<string, (progress: QueryProgress) => void>()
+  private progressTapInstalled = false
 
   constructor(server: IDbConnectionServer, database: IDbConnectionDatabase) {
     super(knex, trinoContext, server, database)
@@ -134,6 +141,7 @@ export class TrinoClient extends BasicDatabaseClient<TrinoResult> {
     this.serverUrl = url
     this.connectionOptions = connectionObj
     this.client = TrinoNodeClient.create(connectionObj)
+    this.installProgressTap(this.client)
     const result = await this.driverExecuteSingle(
       "SELECT version()"
     )
@@ -249,7 +257,9 @@ export class TrinoClient extends BasicDatabaseClient<TrinoResult> {
       ...this.connectionOptions,
       extraHeaders: this.oauthHeaders(token)
     }
+    this.progressTapInstalled = false
     this.client = TrinoNodeClient.create(this.connectionOptions)
+    this.installProgressTap(this.client)
   }
 
   async disconnect(): Promise<void> {
@@ -481,12 +491,23 @@ export class TrinoClient extends BasicDatabaseClient<TrinoResult> {
 
   async query(queryText: string): Promise<CancelableQuery> {
     const cancelable = createCancelablePromise(errors.CANCELED_BY_USER)
+    let progressCallback: ((progress: QueryProgress) => void) | null = null
+    // Tracked per query rather than on the client, so cancelling one query
+    // can't target another that happens to be running on the same connection.
+    let trinoQueryId: string = null
+
     return {
+      onProgress: (callback: (progress: QueryProgress) => void): void => {
+        progressCallback = callback
+      },
       execute: async (): Promise<NgQueryResult[]> => {
         try {
           const data = await Promise.race([
             cancelable.wait(),
-            this.executeQuery(queryText),
+            this.executeQuery(queryText, {
+              _onProgress: (p: QueryProgress) => progressCallback?.(p),
+              _onQueryId: (id: string) => { trinoQueryId = id }
+            }),
           ])
           if (!data) return []
           return data
@@ -500,7 +521,16 @@ export class TrinoClient extends BasicDatabaseClient<TrinoResult> {
         }
       },
       cancel: async (): Promise<void> => {
-       // TODO: How to cancel - would need to switch to a client.execute vs client.query and have a mechanism to connect the running query to the queryId returned during the lifecycle of the query
+        // Trino cancels server-side by query id, which only becomes known once
+        // the first response arrives. Unblock the caller either way.
+        if (trinoQueryId) {
+          try {
+            await this.client.cancel(trinoQueryId)
+          } catch (err) {
+            log.error(`Failed to cancel Trino query ${trinoQueryId}`, err)
+          }
+        }
+        cancelable.cancel()
       },
     }
   }
@@ -514,14 +544,15 @@ export class TrinoClient extends BasicDatabaseClient<TrinoResult> {
   }
 
   async executeQuery(
-    queryText: string
+    queryText: string,
+    options: any = {}
   ): Promise<NgQueryResult[]> {
     const queries = queryText.trim().split(';')
     const results: NgQueryResult[] = await Promise.all(
       queries
         .filter(q => q.trim() !== '')
         .map(async q => {
-          const {rows, columns} = await this.driverExecuteSingle(q)
+          const {rows, columns} = await this.driverExecuteSingle(q, { ...options })
           const fields = rows.length === 0 ? [] : columns.map(c => ({ ...c, id: c.name }))
           return {
             fields,
@@ -535,6 +566,54 @@ export class TrinoClient extends BasicDatabaseClient<TrinoResult> {
     return results
   }
 
+  /**
+   * trino-client's iterator only yields pages that carry rows: while a query
+   * is queued, planning or still scheduling splits, it silently follows
+   * nextUri without emitting anything. That is exactly the stretch where
+   * progress matters, so tap the layer underneath — every polled page passes
+   * through Client.request — and route each one by its query id.
+   */
+  private installProgressTap(trino: any): void {
+    const client = trino?.client
+    if (!client || typeof client.request !== 'function') {
+      log.warn('Could not install the Trino progress tap; falling back to per-page stats')
+      return
+    }
+
+    const original = client.request.bind(client)
+    client.request = async (cfg: any) => {
+      const result = await original(cfg)
+      try {
+        if (result?.id && result?.stats) {
+          this.progressListeners.get(result.id)?.(this.toQueryProgress(result))
+        }
+      } catch (err) {
+        // Progress is informational; never let it break query execution
+        log.error('Trino progress reporting failed', err)
+      }
+      return result
+    }
+    this.progressTapInstalled = true
+  }
+
+  private toQueryProgress(r: QueryResult): QueryProgress {
+    const s = r.stats
+    return {
+      state: s.state,
+      percentage: s.progressPercentage,
+      processedRows: s.processedRows,
+      processedBytes: s.processedBytes,
+      elapsedMillis: s.elapsedTimeMillis,
+      queuedMillis: s.queuedTimeMillis,
+      completedSplits: s.completedSplits,
+      runningSplits: s.runningSplits,
+      totalSplits: s.totalSplits,
+      nodes: s.nodes,
+      driverQueryId: r.id,
+      infoUri: r.infoUri
+    }
+  }
+
   private buildTrinoError(error: QueryError): Error {
     // errorName is the machine code (e.g. COLUMN_NOT_FOUND, TABLE_NOT_FOUND);
     // message carries the human-readable detail with line/column info.
@@ -545,20 +624,44 @@ export class TrinoClient extends BasicDatabaseClient<TrinoResult> {
   }
 
   async rawExecuteQuery(sql: string, options: any = {}): Promise<TrinoResult> {
+    let trackedQueryId: string = null
     try {
       // The trino query parser doesn't particularly like semicolons. Who can blame it?
-      const result: AsyncIterableIterator<QueryResult> = await this.client.query(sql.trim().replace(/;$/, ''))
+      const result: any = await this.client.query(sql.trim().replace(/;$/, ''))
+
+      // The response to the initial POST already carries the query id, which
+      // lets progress be routed correctly even with several queries in flight.
+      const firstPage: QueryResult = result?.iter?.queryResult
+      if (firstPage?.id) {
+        trackedQueryId = firstPage.id
+        this.runningQueryId = firstPage.id
+        options._onQueryId?.(firstPage.id)
+        if (options._onProgress) {
+          this.progressListeners.set(firstPage.id, options._onProgress)
+          if (firstPage.stats) options._onProgress(this.toQueryProgress(firstPage))
+        }
+      }
 
       let columns: ResultColumn[] = []
       const rows: any[] = []
 
-      for await (const r of result) {
+      for await (const r of result as AsyncIterableIterator<QueryResult>) {
         // Trino reports query failures in the response body (HTTP 200 + an
         // `error` field), not via HTTP status, and trino-client never checks
         // for it. Without this the loop finishes empty and a failed query
         // looks like it returned zero rows instead of surfacing the error.
         if (r.error) {
           throw this.buildTrinoError(r.error)
+        }
+
+        if (r.id) {
+          this.runningQueryId = r.id
+          options._onQueryId?.(r.id)
+        }
+        // Fallback only: with the tap installed, progress already comes from
+        // every polled page, including the ones the iterator skips.
+        if (!this.progressTapInstalled && r.stats && options._onProgress) {
+          options._onProgress(this.toQueryProgress(r))
         }
 
         const { data: resultData, columns: resultColumns } = r
@@ -590,6 +693,8 @@ export class TrinoClient extends BasicDatabaseClient<TrinoResult> {
       }
       log.error(err)
       throw err
+    } finally {
+      if (trackedQueryId) this.progressListeners.delete(trackedQueryId)
     }
   }
 

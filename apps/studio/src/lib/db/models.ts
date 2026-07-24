@@ -307,9 +307,40 @@ export interface NgQueryResult {
 
 export type QueryResult = NgQueryResult[];
 
+/**
+ * Execution progress reported by engines that stream status while a query
+ * runs (Trino, and potentially others later). Every field is optional — a
+ * driver fills in only what it actually knows.
+ */
+export interface QueryProgress {
+  /** Engine-reported state, e.g. QUEUED, PLANNING, RUNNING, FINISHING */
+  state?: string;
+  /** Completion estimate, 0-100 */
+  percentage?: number;
+  processedRows?: number;
+  processedBytes?: number;
+  elapsedMillis?: number;
+  queuedMillis?: number;
+  /** Units of parallel work, e.g. Trino splits */
+  completedSplits?: number;
+  runningSplits?: number;
+  totalSplits?: number;
+  /** Workers involved */
+  nodes?: number;
+  /** The engine's own id for the running query */
+  driverQueryId?: string;
+  /** Link to the engine's query UI, when it has one */
+  infoUri?: string;
+}
+
 export interface CancelableQuery {
   execute: () => Promise<QueryResult>;
   cancel: () => Promise<void>;
+  /**
+   * Optional. Drivers that can report progress invoke the callback each time
+   * the engine sends fresh execution stats.
+   */
+  onProgress?: (callback: (progress: QueryProgress) => void) => void;
 }
 
 // Backups
